@@ -9,6 +9,7 @@ import textwrap
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http import client
 from urllib.parse import quote
 
@@ -24,6 +25,10 @@ LOG_PATH = os.path.join(DATA_DIR, "core.log")
 ENV_SH_PATH = os.path.join(DATA_DIR, "proxy_env.sh")
 ENV_FISH_PATH = os.path.join(DATA_DIR, "proxy_env.fish")
 BANNER_TEXT = "提示：↑/↓ 选择，空格确认，q 返回 | Tip: Up/Down to move, Space to select, q to cancel"
+DELAY_TEST_URL = "http://www.gstatic.com/generate_204"
+DELAY_TIMEOUT_MS = 3000
+DELAY_SKIP = {"DIRECT", "REJECT", "REJECT-DROP"}
+DELAY_WORKERS = 20
 
 
 DEFAULT_STATE = {
@@ -229,7 +234,10 @@ def do_start_core(state):
     log_file = open(LOG_PATH, "ab")
     cmd = [core_path, "-d", DATA_DIR, "-f", CONFIG_PATH]
     try:
-        proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
+        if os.name == "nt":
+            proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
+        else:
+            proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file, start_new_session=True)
     except OSError as exc:
         return False, f"Failed to start core: {exc}"
     write_pid(proc.pid)
@@ -273,6 +281,51 @@ def api_request(state, method, path, body=None):
     if raw:
         return json.loads(raw.decode("utf-8"))
     return None
+
+
+def get_delay(state, proxy_name, timeout_ms=DELAY_TIMEOUT_MS, url=DELAY_TEST_URL):
+    if proxy_name in DELAY_SKIP:
+        return None
+    encoded_name = quote(proxy_name, safe="")
+    encoded_url = quote(url, safe="")
+    path = f"/proxies/{encoded_name}/delay?timeout={timeout_ms}&url={encoded_url}"
+    try:
+        data = api_request(state, "GET", path)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    delay = data.get("delay")
+    if delay is None:
+        return None
+    try:
+        delay = int(delay)
+    except (TypeError, ValueError):
+        return None
+    if delay < 0:
+        return None
+    return delay
+
+
+def measure_delays(state, nodes, progress_cb=None):
+    delays = {}
+    total = len(nodes)
+    if total == 0:
+        return delays
+    workers = min(DELAY_WORKERS, total)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_node = {executor.submit(get_delay, state, node): node for node in nodes}
+        done = 0
+        for future in as_completed(future_to_node):
+            node = future_to_node[future]
+            try:
+                delays[node] = future.result()
+            except Exception:
+                delays[node] = None
+            done += 1
+            if progress_cb:
+                progress_cb(done, total)
+    return delays
 
 
 def list_selectors(proxies):
@@ -442,8 +495,13 @@ def cli_select_node(state):
     if not nodes:
         print("No nodes in this group.")
         return
+    print("Measuring latency...")
+    delays = measure_delays(state, nodes, progress_cb=lambda d, t: print(f"{d}/{t}", end="\r", flush=True))
+    print("")
     for idx, node in enumerate(nodes, start=1):
-        print(f"{idx}) {node}")
+        delay = delays.get(node)
+        delay_text = "N/A" if delay is None else f"{delay} ms"
+        print(f"{idx}) {node} [{delay_text}]")
     node_choice = input("Select node: ").strip()
     if not node_choice.isdigit() or not (1 <= int(node_choice) <= len(nodes)):
         print("Invalid node.")
@@ -563,13 +621,23 @@ def tui_menu(stdscr, title, options, footer="Up/Down to move, Space to select, q
             stdscr.addstr(0, 0, BANNER_TEXT[: width - 1])
         stdscr.addstr(1, 0, title[: width - 1], curses.A_BOLD)
         for i, option in enumerate(options):
+            if isinstance(option, tuple):
+                text, color_pair = option
+            else:
+                text, color_pair = option, 0
             y = 3 + i
             if y >= height - 2:
                 break
             if i == idx:
-                stdscr.addstr(y, 0, option[: width - 1], curses.A_REVERSE)
+                attrs = curses.A_REVERSE
+                if color_pair:
+                    attrs |= curses.color_pair(color_pair)
+                stdscr.addstr(y, 0, text[: width - 1], attrs)
             else:
-                stdscr.addstr(y, 0, option[: width - 1])
+                if color_pair:
+                    stdscr.addstr(y, 0, text[: width - 1], curses.color_pair(color_pair))
+                else:
+                    stdscr.addstr(y, 0, text[: width - 1])
         stdscr.addstr(height - 1, 0, footer[: width - 1])
         stdscr.refresh()
         key = stdscr.getch()
@@ -598,7 +666,33 @@ def tui_select_node(stdscr, state):
     if not nodes:
         tui_message(stdscr, "Select Node", "No nodes in this group.")
         return
-    node_idx = tui_menu(stdscr, f"Select Node - {group}", nodes)
+    def _progress(done, total):
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+        title = "Testing latency..."
+        stdscr.addstr(0, 0, title[: width - 1], curses.A_BOLD)
+        stdscr.addstr(2, 0, f"{done}/{total}"[: width - 1])
+        stdscr.addstr(height - 1, 0, "Please wait..."[: width - 1])
+        stdscr.refresh()
+
+    delays = measure_delays(state, nodes, progress_cb=_progress)
+    options = []
+    for node in nodes:
+        delay = delays.get(node)
+        if delay is None:
+            delay_text = "N/A"
+            color = 4
+        elif delay <= 200:
+            delay_text = f"{delay} ms"
+            color = 2
+        elif delay <= 800:
+            delay_text = f"{delay} ms"
+            color = 3
+        else:
+            delay_text = f"{delay} ms"
+            color = 4
+        options.append((f"{node} [{delay_text}]", color))
+    node_idx = tui_menu(stdscr, f"Select Node - {group}", options)
     if node_idx is None:
         return
     node = nodes[node_idx]
@@ -631,6 +725,9 @@ def run_tui():
             curses.start_color()
             curses.use_default_colors()
             curses.init_pair(1, curses.COLOR_GREEN, -1)
+            curses.init_pair(2, curses.COLOR_GREEN, -1)
+            curses.init_pair(3, curses.COLOR_YELLOW, -1)
+            curses.init_pair(4, curses.COLOR_RED, -1)
         curses.curs_set(0)
         while True:
             options = [
